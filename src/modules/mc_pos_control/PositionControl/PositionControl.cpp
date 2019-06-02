@@ -141,44 +141,37 @@ void PositionControl::_velocityController(const float &dt)
 	// - the desired thrust in NE-direction is limited by the thrust excess after
 	// 	 consideration of the desired thrust in D-direction. In addition, the thrust in
 	// 	 NE-direction is also limited by the maximum tilt.
-	Vector3f thr_sp_velocity; // thrust setpoint output of the velocity controller
-	Vector3f acc_sp_velocity; // acceleration setpoint output of the velocity controller
+	static constexpr float CONSTANTS_ONE_G = 9.80665f; // m/s^2
+	const float hover_scale = CONSTANTS_ONE_G / _param_mpc_thr_hover.get(); // For backwards compatibility of the gains
+	const Vector3f vel_gain_p(_param_mpc_xy_vel_p.get(), _param_mpc_xy_vel_p.get(), _param_mpc_z_vel_p.get());
+	const Vector3f vel_gain_i(_param_mpc_xy_vel_i.get(), _param_mpc_xy_vel_i.get(), _param_mpc_z_vel_i.get());
+	const Vector3f vel_gain_d(_param_mpc_xy_vel_d.get(), _param_mpc_xy_vel_d.get(), _param_mpc_z_vel_d.get());
 
 	const Vector3f vel_err = _vel_sp - _vel;
 
-	// Acceleration to thrust addition conversion
-	static constexpr float CONSTANTS_ONE_G = 9.80665f; // m/s^2
-	const float scale = CONSTANTS_ONE_G / _param_mpc_thr_hover.get();
-	const Vector3f thr_ff = _acc_sp * _param_mpc_thr_hover.get() / CONSTANTS_ONE_G;
+	Vector3f acc_sp_velocity = vel_gain_p.emult(vel_err) + _vel_int + vel_gain_d.emult(_vel_dot);
+	acc_sp_velocity *= hover_scale;
+	_addIfNotNanVector(_acc_sp, acc_sp_velocity);
 
-	// Consider thrust in D-direction.
-	float thrust_desired_D = _param_mpc_z_vel_p.get() * vel_err(2) +  _param_mpc_z_vel_d.get() * _vel_dot(2) + _vel_int(
-					 2) - _param_mpc_thr_hover.get();
-	_addIfNotNan(thrust_desired_D, thr_ff(2));
-
-	acc_sp_velocity(2) += scale * (_param_mpc_z_vel_p.get() * vel_err(2) +  _param_mpc_z_vel_d.get() * _vel_dot(2) + _vel_int(
-				       2));
+	Vector3f thr_sp_velocity = (_acc_sp / hover_scale) - _param_mpc_thr_hover.get();
 
 	// The Thrust limits are negated and swapped due to NED-frame.
-	float uMax = -_param_mpc_thr_min.get();
+	float uMax = math::min(-_param_mpc_thr_min.get(), -10e-4f);
 	float uMin = -_param_mpc_thr_max.get();
 
-	// make sure there's always enough thrust vector length to infer the attitude
-	uMax = math::min(uMax, -10e-4f);
-
-	// Apply Anti-Windup in D-direction.
-	bool stop_integral_D = (thrust_desired_D >= uMax && vel_err(2) >= 0.0f) ||
-			       (thrust_desired_D <= uMin && vel_err(2) <= 0.0f);
+	// Apply Anti-Windup in vertical direction
+	bool stop_integral_D = (thr_sp_velocity(2) >= uMax && vel_err(2) >= 0.0f) ||
+			       (thr_sp_velocity(2) <= uMin && vel_err(2) <= 0.0f);
 
 	if (!stop_integral_D) {
-		_vel_int(2) += vel_err(2) * _param_mpc_z_vel_i.get() * dt;
+		_vel_int(2) += vel_err(2) * vel_gain_i(2) * dt;
 
 		// limit thrust integral
 		_vel_int(2) = math::min(fabsf(_vel_int(2)), _param_mpc_thr_max.get()) * math::sign(_vel_int(2));
 	}
 
 	// Saturate thrust setpoint in D-direction.
-	thr_sp_velocity(2) = math::constrain(thrust_desired_D, uMin, uMax);
+	thr_sp_velocity(2) = math::constrain(thr_sp_velocity(2), uMin, uMax);
 
 	if (PX4_ISFINITE(_thr_sp(0)) && PX4_ISFINITE(_thr_sp(1))) {
 		// Thrust set-point in NE-direction is already provided. Only
@@ -186,26 +179,18 @@ void PositionControl::_velocityController(const float &dt)
 		float thr_xy_max = fabsf(thr_sp_velocity(2)) * tanf(_constraints.tilt);
 		_thr_sp(0) *= thr_xy_max;
 		_thr_sp(1) *= thr_xy_max;
+		thr_sp_velocity(0) = thr_sp_velocity(1) = 0.f;
 
 	} else {
-		// PID-velocity controller for NE-direction.
-		Vector2f thrust_desired_NE;
-		thrust_desired_NE(0) = _param_mpc_xy_vel_p.get() * vel_err(0) + _param_mpc_xy_vel_d.get() * _vel_dot(0) + _vel_int(0);
-		thrust_desired_NE(1) = _param_mpc_xy_vel_p.get() * vel_err(1) + _param_mpc_xy_vel_d.get() * _vel_dot(1) + _vel_int(1);
-		_addIfNotNan(thrust_desired_NE(0), thr_ff(0));
-		_addIfNotNan(thrust_desired_NE(1), thr_ff(1));
-
-		acc_sp_velocity(0) += scale * (_param_mpc_xy_vel_p.get() * vel_err(0) + _param_mpc_xy_vel_d.get() * _vel_dot(0) + _vel_int(0));
-		acc_sp_velocity(1) += scale * (_param_mpc_xy_vel_p.get() * vel_err(1) + _param_mpc_xy_vel_d.get() * _vel_dot(1) + _vel_int(1));
-
-		// Get maximum allowed thrust in NE based on tilt and excess thrust.
+		// Get maximum allowed horizontal thrust based on tilt and excess thrust.
 		float thrust_max_NE_tilt = fabsf(_thr_sp(2)) * tanf(_constraints.tilt);
 		float thrust_max_NE = sqrtf(_param_mpc_thr_max.get() * _param_mpc_thr_max.get() - _thr_sp(2) * _thr_sp(2));
 		thrust_max_NE = math::min(thrust_max_NE_tilt, thrust_max_NE);
 
 		// Saturate thrust in NE-direction.
-		thr_sp_velocity(0) = thrust_desired_NE(0);
-		thr_sp_velocity(1) = thrust_desired_NE(1);
+		Vector2f thrust_desired_NE;
+		thrust_desired_NE(0) = thr_sp_velocity(0);
+		thrust_desired_NE(1) = thr_sp_velocity(1);
 
 		if (thrust_desired_NE * thrust_desired_NE > thrust_max_NE * thrust_max_NE) {
 			float mag = thrust_desired_NE.length();
@@ -222,8 +207,8 @@ void PositionControl::_velocityController(const float &dt)
 		vel_err_lim(1) = vel_err(1) - (thrust_desired_NE(1) - thr_sp_velocity(1)) * arw_gain;
 
 		// Update integral
-		_vel_int(0) += _param_mpc_xy_vel_i.get() * vel_err_lim(0) * dt;
-		_vel_int(1) += _param_mpc_xy_vel_i.get() * vel_err_lim(1) * dt;
+		_vel_int(0) += vel_gain_i(0) * vel_err_lim(0) * dt;
+		_vel_int(1) += vel_gain_i(1) * vel_err_lim(1) * dt;
 	}
 
 	// No control input from setpoints or corresponding states which are NAN, reset integrator if necessary
@@ -265,6 +250,7 @@ void PositionControl::_addIfNotNan(float &setpoint, const float addition)
 		// Setpoint NAN, take addition
 		setpoint = addition;
 	}
+
 	// Addition is NAN or both are NAN, nothing to do
 }
 
